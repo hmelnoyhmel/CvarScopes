@@ -1,0 +1,21 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0",
+  "FriendlyName": "Cvar Scopes",
+  "Description": "Named Console Variable profiles for the Unreal Editor.",
+  "Category": "Editor",
+  "CreatedBy": "",
+  "CanContainContent": false,
+  "EnabledByDefault": true,
+  "IsBetaVersion": false,
+  "IsExperimentalVersion": false,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "CvarScopes",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    }
+  ]
+}
