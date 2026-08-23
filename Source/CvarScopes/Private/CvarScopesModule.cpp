@@ -5,6 +5,10 @@
 #include "Framework/Docking/TabManager.h"
 #include "HAL/FileManager.h"
 #include "HAL/IConsoleManager.h"
+#include "Fonts/FontMeasure.h"
+#include "Rendering/SlateRenderer.h"
+#include "Styling/AppStyle.h"
+#include "Styling/CoreStyle.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Serialization/JsonSerializer.h"
@@ -15,6 +19,7 @@
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SComboButton.h"
 #include "Widgets/Input/SEditableTextBox.h"
+#include "Widgets/Input/SSuggestionTextBox.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
 #include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Layout/SScrollBar.h"
@@ -422,6 +427,12 @@ void FCvarScopesModule::UpdateSelectedCommands(const FText& NewCommands)
 
 TSharedRef<SWidget> FCvarScopesModule::BuildCommandsEditor()
 {
+	const FSlateFontInfo NotepadFont = FAppStyle::GetFontStyle("NormalFont");
+	const FTextBlockStyle& NotepadTextStyle = FCoreStyle::Get().GetWidgetStyle<FTextBlockStyle>("NormalText");
+	const float MaxCharacterHeight = FSlateApplication::Get().GetRenderer()->GetFontMeasureService()->GetMaxCharacterHeight(NotepadFont);
+	NotepadLineHeight = MaxCharacterHeight
+		+ FMath::Abs(NotepadTextStyle.ShadowOffset.Y)
+		+ NotepadFont.OutlineSettings.OutlineSize;
 	RefreshValidation();
 	NotepadScrollBar = SNew(SScrollBar);
 	return SNew(SHorizontalBox)
@@ -438,6 +449,7 @@ TSharedRef<SWidget> FCvarScopesModule::BuildCommandsEditor()
 			.Text_Lambda([this] { const FScope* Scope = GetSelectedScope(); return Scope ? FText::FromString(Scope->Commands) : FText::GetEmpty(); })
 			.OnTextChanged_Raw(this, &FCvarScopesModule::UpdateSelectedCommands)
 			.HintText(LOCTEXT("CommandsHint", "One CVar assignment per line, for example: r.Nanite 0"))
+			.Font(NotepadFont)
 			.VScrollBar(NotepadScrollBar)
 		]
 		+ SHorizontalBox::Slot().AutoWidth()
@@ -464,6 +476,22 @@ void FCvarScopesModule::RefreshValidation()
 	for (const TSharedPtr<FTableEntry>& Entry : TableItems)
 	{
 		Entry->Diagnostic = Entry->bIsCommentOrEmpty ? FDiagnostic() : ValidateAssignment(Entry->Name.TrimStartAndEnd(), Entry->Value.TrimStartAndEnd());
+	}
+	TMap<FString, TArray<TSharedPtr<FTableEntry>>> ValidEntriesByName;
+	for (const TSharedPtr<FTableEntry>& Entry : TableItems)
+	{
+		if (!Entry->bIsCommentOrEmpty && Entry->Diagnostic.Severity == EDiagnosticSeverity::None && !Entry->Name.TrimStartAndEnd().IsEmpty()) { ValidEntriesByName.FindOrAdd(Entry->Name.TrimStartAndEnd().ToLower()).Add(Entry); }
+	}
+	for (const TPair<FString, TArray<TSharedPtr<FTableEntry>>>& Pair : ValidEntriesByName)
+	{
+		if (Pair.Value.Num() > 1)
+		{
+			for (const TSharedPtr<FTableEntry>& Entry : Pair.Value)
+			{
+				Entry->Diagnostic.bIsDuplicate = true;
+				Entry->Diagnostic.Message = TEXT("Duplicate CVar. The last valid assignment is applied.");
+			}
+		}
 	}
 	if (NotepadDiagnosticsContainer.IsValid()) { NotepadDiagnosticsContainer->SetContent(BuildNotepadDiagnosticsGutter()); }
 	if (TableListView.IsValid()) { TableListView->Invalidate(EInvalidateWidgetReason::Layout | EInvalidateWidgetReason::Paint); }
@@ -526,6 +554,7 @@ TArray<FCvarScopesModule::FLineDiagnostic> FCvarScopesModule::ValidateCommands(c
 	TArray<FLineDiagnostic> Result;
 	TArray<FString> Lines;
 	Commands.ParseIntoArrayLines(Lines, false);
+	TMap<FString, TArray<int32>> ValidLinesByName;
 	for (int32 LineIndex = 0; LineIndex < Lines.Num(); ++LineIndex)
 	{
 		FString Line = Lines[LineIndex].TrimStartAndEnd();
@@ -536,6 +565,20 @@ TArray<FCvarScopesModule::FLineDiagnostic> FCvarScopesModule::ValidateCommands(c
 		const FString Value = SplitIndex == INDEX_NONE ? FString() : Line.Mid(SplitIndex).TrimStartAndEnd();
 		const FDiagnostic Diagnostic = ValidateAssignment(Name, Value);
 		if (Diagnostic.Severity != EDiagnosticSeverity::None) { Result.Add({ LineIndex, Diagnostic }); }
+		else if (!Name.IsEmpty()) { ValidLinesByName.FindOrAdd(Name.ToLower()).Add(LineIndex); }
+	}
+	for (const TPair<FString, TArray<int32>>& Pair : ValidLinesByName)
+	{
+		if (Pair.Value.Num() > 1)
+		{
+			for (const int32 LineIndex : Pair.Value)
+			{
+				FDiagnostic Diagnostic;
+				Diagnostic.bIsDuplicate = true;
+				Diagnostic.Message = TEXT("Duplicate CVar. The last valid assignment is applied.");
+				Result.Add({ LineIndex, Diagnostic });
+			}
+		}
 	}
 	return Result;
 }
@@ -561,7 +604,32 @@ FString FCvarScopesModule::GetValueTypeHint(ECvarValueType ValueType)
 
 FSlateColor FCvarScopesModule::GetDiagnosticColor(const FDiagnostic& Diagnostic)
 {
+	if (Diagnostic.bIsDuplicate) { return FSlateColor::UseForeground(); }
 	return Diagnostic.Severity == EDiagnosticSeverity::Error ? FSlateColor(FLinearColor(0.9f, 0.2f, 0.2f)) : FSlateColor(FLinearColor(0.95f, 0.75f, 0.15f));
+}
+
+FString FCvarScopesModule::GetDiagnosticSymbol(const FDiagnostic& Diagnostic)
+{
+	if (Diagnostic.bIsDuplicate) { return TEXT("\U0001F4CB"); }
+	if (Diagnostic.Severity == EDiagnosticSeverity::Error) { return TEXT("\u26A0"); }
+	if (Diagnostic.Severity == EDiagnosticSeverity::Warning) { return TEXT("?"); }
+	return FString();
+}
+
+void FCvarScopesModule::GetCvarSuggestions(const FString& Input, TArray<FString>& OutSuggestions)
+{
+	const FString Prefix = Input.TrimStartAndEnd();
+	if (Prefix.IsEmpty()) { return; }
+
+	IConsoleManager::Get().ForEachConsoleObjectThatStartsWith(FConsoleObjectVisitor::CreateLambda([&OutSuggestions](const TCHAR* Name, IConsoleObject* ConsoleObject)
+	{
+		if (ConsoleObject && (ConsoleObject->IsVariableBool() || ConsoleObject->IsVariableInt() || ConsoleObject->IsVariableFloat() || ConsoleObject->IsVariableString()))
+		{
+			OutSuggestions.Add(Name);
+		}
+	}), *Prefix);
+	OutSuggestions.Sort();
+	if (OutSuggestions.Num() > 50) { OutSuggestions.SetNum(50); }
 }
 
 TSharedRef<SWidget> FCvarScopesModule::BuildNotepadDiagnosticsGutter()
@@ -574,7 +642,7 @@ TSharedRef<SWidget> FCvarScopesModule::BuildNotepadDiagnosticsGutter()
 	for (int32 LineIndex = 0; LineIndex < LineCount; ++LineIndex)
 	{
 		const FDiagnostic* Diagnostic = DiagnosticsByLine.Find(LineIndex);
-		LinesBox->AddSlot().AutoHeight()[SNew(SBox).WidthOverride(18.0f).HeightOverride(18.0f).HAlign(HAlign_Center).VAlign(VAlign_Center)[SNew(STextBlock).Text(Diagnostic ? FText::FromString(Diagnostic->Severity == EDiagnosticSeverity::Error ? TEXT("\u26A0") : TEXT("?")) : FText::GetEmpty()).ColorAndOpacity(Diagnostic ? GetDiagnosticColor(*Diagnostic) : FSlateColor::UseForeground()).ToolTipText(Diagnostic ? FText::FromString(Diagnostic->Message) : FText::GetEmpty())]];
+		LinesBox->AddSlot().AutoHeight()[SNew(SBox).WidthOverride(18.0f).HeightOverride(NotepadLineHeight).HAlign(HAlign_Center).VAlign(VAlign_Center)[SNew(STextBlock).Font(FAppStyle::GetFontStyle("NormalFont")).Text(Diagnostic ? FText::FromString(GetDiagnosticSymbol(*Diagnostic)) : FText::GetEmpty()).ColorAndOpacity(Diagnostic ? GetDiagnosticColor(*Diagnostic) : FSlateColor::UseForeground()).ToolTipText(Diagnostic ? FText::FromString(Diagnostic->Message) : FText::GetEmpty())]];
 	}
 	return SNew(SScrollBox).Orientation(Orient_Vertical).ExternalScrollbar(NotepadScrollBar).ScrollBarVisibility(EVisibility::Collapsed) + SScrollBox::Slot()[LinesBox];
 }
@@ -585,6 +653,15 @@ TSharedRef<SWidget> FCvarScopesModule::BuildTableEditor()
 	for (const TSharedPtr<FTableEntry>& Entry : TableItems)
 	{
 		Entry->Diagnostic = Entry->bIsCommentOrEmpty ? FDiagnostic() : ValidateAssignment(Entry->Name.TrimStartAndEnd(), Entry->Value.TrimStartAndEnd());
+	}
+	TMap<FString, TArray<TSharedPtr<FTableEntry>>> ValidEntriesByName;
+	for (const TSharedPtr<FTableEntry>& Entry : TableItems)
+	{
+		if (!Entry->bIsCommentOrEmpty && Entry->Diagnostic.Severity == EDiagnosticSeverity::None && !Entry->Name.TrimStartAndEnd().IsEmpty()) { ValidEntriesByName.FindOrAdd(Entry->Name.TrimStartAndEnd().ToLower()).Add(Entry); }
+	}
+	for (const TPair<FString, TArray<TSharedPtr<FTableEntry>>>& Pair : ValidEntriesByName)
+	{
+		if (Pair.Value.Num() > 1) { for (const TSharedPtr<FTableEntry>& Entry : Pair.Value) { Entry->Diagnostic.bIsDuplicate = true; Entry->Diagnostic.Message = TEXT("Duplicate CVar. The last valid assignment is applied."); } }
 	}
 	return SNew(SVerticalBox)
 		+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 4.0f)
@@ -626,13 +703,18 @@ TSharedRef<SWidget> FCvarScopesModule::BuildTableEditor()
 					[
 						SNew(SBox).WidthOverride(18.0f).HAlign(HAlign_Center).VAlign(VAlign_Center)
 						[
-							SNew(STextBlock).Text_Lambda([Entry] { return Entry->Diagnostic.Severity == EDiagnosticSeverity::None ? FText::GetEmpty() : FText::FromString(Entry->Diagnostic.Severity == EDiagnosticSeverity::Error ? TEXT("\u26A0") : TEXT("?")); }).ColorAndOpacity_Lambda([Entry] { return GetDiagnosticColor(Entry->Diagnostic); }).ToolTipText_Lambda([Entry] { return FText::FromString(Entry->Diagnostic.Message); })
+							SNew(STextBlock).Text_Lambda([Entry] { return FText::FromString(GetDiagnosticSymbol(Entry->Diagnostic)); }).ColorAndOpacity_Lambda([Entry] { return GetDiagnosticColor(Entry->Diagnostic); }).ToolTipText_Lambda([Entry] { return FText::FromString(Entry->Diagnostic.Message); })
 						]
 					]
 					+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
 					[
-						SNew(SEditableTextBox)
+						SNew(SSuggestionTextBox)
 						.Text_Lambda([Entry] { return FText::FromString(Entry->Name); })
+						.HintText(LOCTEXT("TableNameHint", "CVar name"))
+						.ForegroundColor(FSlateColor::UseForeground())
+						.SuggestionListMaxHeight(220.0f)
+						.CommitOnSuggestionSelected(false)
+						.OnShowingSuggestions_Lambda([](const FString& Input, TArray<FString>& Suggestions) { GetCvarSuggestions(Input, Suggestions); })
 						.OnTextChanged_Lambda([this, Entry](const FText& NewText) { UpdateTableEntry(Entry, NewText, true); })
 					]
 					+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)

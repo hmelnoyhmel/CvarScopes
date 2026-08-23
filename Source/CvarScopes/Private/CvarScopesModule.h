@@ -37,6 +37,7 @@ public:
 		EDiagnosticSeverity Severity = EDiagnosticSeverity::None;
 		ECvarValueType ValueType = ECvarValueType::Unknown;
 		FString Message;
+		bool bIsDuplicate = false;
 	};
 
 	struct FLineDiagnostic
@@ -93,7 +94,9 @@ private:
 	static bool IsBooleanValue(const FString& Value, bool& OutValue);
 	static FString GetValueTypeHint(ECvarValueType ValueType);
 	static FSlateColor GetDiagnosticColor(const FDiagnostic& Diagnostic);
+	static FString GetDiagnosticSymbol(const FDiagnostic& Diagnostic);
 	TSharedRef<class SWidget> BuildNotepadDiagnosticsGutter();
+	static void GetCvarSuggestions(const FString& Input, TArray<FString>& OutSuggestions);
 	void UpdateTableBoolEntry(TSharedPtr<FTableEntry> Entry, ECheckBoxState NewState);
 	TSharedRef<class SWidget> BuildCommandsEditor();
 	TSharedRef<class SWidget> BuildTableEditor();
@@ -124,6 +127,7 @@ private:
 	TSharedPtr<SScrollBar> NotepadScrollBar;
 	TArray<FLineDiagnostic> NotepadDiagnostics;
 	FTSTicker::FDelegateHandle ValidationTickerHandle;
+	float NotepadLineHeight = 18.0f;
 	int32 SelectedScopeIndex = 0;
 	FString ActiveScopeName;
 	FString LastActivatedScopeName;
