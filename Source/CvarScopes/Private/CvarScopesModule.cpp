@@ -1,6 +1,7 @@
 #include "CvarScopesModule.h"
 
 #include "Framework/Application/SlateApplication.h"
+#include "Containers/Ticker.h"
 #include "Framework/Docking/TabManager.h"
 #include "HAL/FileManager.h"
 #include "HAL/IConsoleManager.h"
@@ -15,9 +16,13 @@
 #include "Widgets/Input/SComboButton.h"
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
+#include "Widgets/Input/SCheckBox.h"
+#include "Widgets/Layout/SScrollBar.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SSplitter.h"
+#include "Widgets/Layout/SScrollBox.h"
+#include "Widgets/SOverlay.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Views/SListView.h"
@@ -57,6 +62,10 @@ void FCvarScopesModule::StartupModule()
 
 void FCvarScopesModule::ShutdownModule()
 {
+	if (ValidationTickerHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(ValidationTickerHandle);
+	}
 	SaveScopes();
 	UToolMenus::UnRegisterStartupCallback(this);
 	UToolMenus::UnregisterOwner(this);
@@ -407,24 +416,184 @@ void FCvarScopesModule::UpdateSelectedCommands(const FText& NewCommands)
 	{
 		if (Scope->Commands != NewCommands.ToString() && ActiveScopeName.Equals(Scope->Name, ESearchCase::CaseSensitive)) { ActiveScopeName.Empty(); }
 		Scope->Commands = NewCommands.ToString();
+		ScheduleValidation();
 	}
 }
 
 TSharedRef<SWidget> FCvarScopesModule::BuildCommandsEditor()
 {
-	return SNew(SMultiLineEditableTextBox)
-		.Text_Lambda([this] { const FScope* Scope = GetSelectedScope(); return Scope ? FText::FromString(Scope->Commands) : FText::GetEmpty(); })
-		.OnTextChanged_Raw(this, &FCvarScopesModule::UpdateSelectedCommands)
-		.HintText(LOCTEXT("CommandsHint", "One CVar assignment per line, for example: r.Nanite 0"));
+	RefreshValidation();
+	NotepadScrollBar = SNew(SScrollBar);
+	return SNew(SHorizontalBox)
+		+ SHorizontalBox::Slot().AutoWidth()
+		[
+			SAssignNew(NotepadDiagnosticsContainer, SBox)
+			[
+				BuildNotepadDiagnosticsGutter()
+			]
+		]
+		+ SHorizontalBox::Slot().FillWidth(1.0f)
+		[
+			SNew(SMultiLineEditableTextBox)
+			.Text_Lambda([this] { const FScope* Scope = GetSelectedScope(); return Scope ? FText::FromString(Scope->Commands) : FText::GetEmpty(); })
+			.OnTextChanged_Raw(this, &FCvarScopesModule::UpdateSelectedCommands)
+			.HintText(LOCTEXT("CommandsHint", "One CVar assignment per line, for example: r.Nanite 0"))
+			.VScrollBar(NotepadScrollBar)
+		]
+		+ SHorizontalBox::Slot().AutoWidth()
+		[
+			NotepadScrollBar.ToSharedRef()
+		];
+}
+
+void FCvarScopesModule::ScheduleValidation()
+{
+	if (ValidationTickerHandle.IsValid()) { FTSTicker::GetCoreTicker().RemoveTicker(ValidationTickerHandle); }
+	ValidationTickerHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([this](float)
+	{
+		ValidationTickerHandle.Reset();
+		RefreshValidation();
+		return false;
+	}), 0.25f);
+}
+
+void FCvarScopesModule::RefreshValidation()
+{
+	const FScope* Scope = GetSelectedScope();
+	NotepadDiagnostics = Scope ? ValidateCommands(Scope->Commands) : TArray<FLineDiagnostic>();
+	for (const TSharedPtr<FTableEntry>& Entry : TableItems)
+	{
+		Entry->Diagnostic = Entry->bIsCommentOrEmpty ? FDiagnostic() : ValidateAssignment(Entry->Name.TrimStartAndEnd(), Entry->Value.TrimStartAndEnd());
+	}
+	if (NotepadDiagnosticsContainer.IsValid()) { NotepadDiagnosticsContainer->SetContent(BuildNotepadDiagnosticsGutter()); }
+	if (TableListView.IsValid()) { TableListView->Invalidate(EInvalidateWidgetReason::Layout | EInvalidateWidgetReason::Paint); }
+}
+
+FCvarScopesModule::FDiagnostic FCvarScopesModule::ValidateAssignment(const FString& Name, const FString& Value) const
+{
+	if (Name.IsEmpty()) { return FDiagnostic(); }
+	FDiagnostic Result;
+	IConsoleVariable* Variable = IConsoleManager::Get().FindConsoleVariable(*Name);
+	if (!Variable)
+	{
+		Result.Severity = EDiagnosticSeverity::Error;
+		Result.Message = FString::Printf(TEXT("CVAR '%s' was not found."), *Name);
+		return Result;
+	}
+	if (Variable->IsVariableBool()) { Result.ValueType = ECvarValueType::Bool; }
+	else if (Variable->IsVariableInt()) { Result.ValueType = ECvarValueType::Int; }
+	else if (Variable->IsVariableFloat()) { Result.ValueType = ECvarValueType::Float; }
+	else if (Variable->IsVariableString()) { Result.ValueType = ECvarValueType::String; }
+
+	if (Value.IsEmpty())
+	{
+		Result.Severity = EDiagnosticSeverity::Warning;
+		Result.Message = FString::Printf(TEXT("Expected %s value."), *GetValueTypeHint(Result.ValueType));
+		return Result;
+	}
+	if (Result.ValueType == ECvarValueType::Bool)
+	{
+		bool bValue = false;
+		if (!IsBooleanValue(Value, bValue))
+		{
+			Result.Severity = EDiagnosticSeverity::Warning;
+			Result.Message = TEXT("Expected boolean: 0, 1, false or true.");
+		}
+	}
+	else if (Result.ValueType == ECvarValueType::Int)
+	{
+		int32 ParsedValue = 0;
+		if (!LexTryParseString(ParsedValue, *Value))
+		{
+			Result.Severity = EDiagnosticSeverity::Warning;
+			Result.Message = TEXT("Expected integer value.");
+		}
+	}
+	else if (Result.ValueType == ECvarValueType::Float)
+	{
+		float ParsedValue = 0.0f;
+		if (!LexTryParseString(ParsedValue, *Value))
+		{
+			Result.Severity = EDiagnosticSeverity::Warning;
+			Result.Message = TEXT("Expected floating-point value.");
+		}
+	}
+	return Result;
+}
+
+TArray<FCvarScopesModule::FLineDiagnostic> FCvarScopesModule::ValidateCommands(const FString& Commands) const
+{
+	TArray<FLineDiagnostic> Result;
+	TArray<FString> Lines;
+	Commands.ParseIntoArrayLines(Lines, false);
+	for (int32 LineIndex = 0; LineIndex < Lines.Num(); ++LineIndex)
+	{
+		FString Line = Lines[LineIndex].TrimStartAndEnd();
+		if (Line.IsEmpty() || Line.StartsWith(TEXT("#")) || Line.StartsWith(TEXT(";"))) { continue; }
+		int32 SplitIndex = INDEX_NONE;
+		for (int32 Index = 0; Index < Line.Len(); ++Index) { if (FChar::IsWhitespace(Line[Index])) { SplitIndex = Index; break; } }
+		const FString Name = SplitIndex == INDEX_NONE ? Line : Line.Left(SplitIndex);
+		const FString Value = SplitIndex == INDEX_NONE ? FString() : Line.Mid(SplitIndex).TrimStartAndEnd();
+		const FDiagnostic Diagnostic = ValidateAssignment(Name, Value);
+		if (Diagnostic.Severity != EDiagnosticSeverity::None) { Result.Add({ LineIndex, Diagnostic }); }
+	}
+	return Result;
+}
+
+bool FCvarScopesModule::IsBooleanValue(const FString& Value, bool& OutValue)
+{
+	if (Value.Equals(TEXT("1")) || Value.Equals(TEXT("true"), ESearchCase::IgnoreCase)) { OutValue = true; return true; }
+	if (Value.Equals(TEXT("0")) || Value.Equals(TEXT("false"), ESearchCase::IgnoreCase)) { OutValue = false; return true; }
+	return false;
+}
+
+FString FCvarScopesModule::GetValueTypeHint(ECvarValueType ValueType)
+{
+	switch (ValueType)
+	{
+	case ECvarValueType::Bool: return TEXT("Boolean");
+	case ECvarValueType::Int: return TEXT("Integer");
+	case ECvarValueType::Float: return TEXT("Float");
+	case ECvarValueType::String: return TEXT("String");
+	default: return TEXT("CVAR");
+	}
+}
+
+FSlateColor FCvarScopesModule::GetDiagnosticColor(const FDiagnostic& Diagnostic)
+{
+	return Diagnostic.Severity == EDiagnosticSeverity::Error ? FSlateColor(FLinearColor(0.9f, 0.2f, 0.2f)) : FSlateColor(FLinearColor(0.95f, 0.75f, 0.15f));
+}
+
+TSharedRef<SWidget> FCvarScopesModule::BuildNotepadDiagnosticsGutter()
+{
+	TMap<int32, FDiagnostic> DiagnosticsByLine;
+	for (const FLineDiagnostic& Item : NotepadDiagnostics) { DiagnosticsByLine.Add(Item.LineIndex, Item.Diagnostic); }
+	int32 LineCount = 1;
+	if (const FScope* Scope = GetSelectedScope()) { TArray<FString> Lines; Scope->Commands.ParseIntoArrayLines(Lines, false); LineCount = FMath::Max(1, Lines.Num()); }
+	TSharedRef<SVerticalBox> LinesBox = SNew(SVerticalBox);
+	for (int32 LineIndex = 0; LineIndex < LineCount; ++LineIndex)
+	{
+		const FDiagnostic* Diagnostic = DiagnosticsByLine.Find(LineIndex);
+		LinesBox->AddSlot().AutoHeight()[SNew(SBox).WidthOverride(18.0f).HeightOverride(18.0f).HAlign(HAlign_Center).VAlign(VAlign_Center)[SNew(STextBlock).Text(Diagnostic ? FText::FromString(Diagnostic->Severity == EDiagnosticSeverity::Error ? TEXT("\u26A0") : TEXT("?")) : FText::GetEmpty()).ColorAndOpacity(Diagnostic ? GetDiagnosticColor(*Diagnostic) : FSlateColor::UseForeground()).ToolTipText(Diagnostic ? FText::FromString(Diagnostic->Message) : FText::GetEmpty())]];
+	}
+	return SNew(SScrollBox).Orientation(Orient_Vertical).ExternalScrollbar(NotepadScrollBar).ScrollBarVisibility(EVisibility::Collapsed) + SScrollBox::Slot()[LinesBox];
 }
 
 TSharedRef<SWidget> FCvarScopesModule::BuildTableEditor()
 {
 	RebuildTableItems();
+	for (const TSharedPtr<FTableEntry>& Entry : TableItems)
+	{
+		Entry->Diagnostic = Entry->bIsCommentOrEmpty ? FDiagnostic() : ValidateAssignment(Entry->Name.TrimStartAndEnd(), Entry->Value.TrimStartAndEnd());
+	}
 	return SNew(SVerticalBox)
 		+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 4.0f)
 		[
 			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
+			[
+				SNew(SBox).WidthOverride(18.0f)
+			]
 			+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
 			[
 				SNew(STextBlock).Text(LOCTEXT("TableNameColumn", "CVar"))
@@ -441,9 +610,25 @@ TSharedRef<SWidget> FCvarScopesModule::BuildTableEditor()
 			.SelectionMode(ESelectionMode::Single)
 			.OnGenerateRow_Lambda([this](TSharedPtr<FTableEntry> Entry, const TSharedRef<STableViewBase>& Owner)
 			{
+				TSharedRef<SWidget> ValueWidget = SNew(SOverlay)
+					+ SOverlay::Slot()
+					[
+						SNew(SEditableTextBox).Text_Lambda([Entry] { return FText::FromString(Entry->Value); }).HintText_Lambda([Entry] { return FText::FromString(Entry->Diagnostic.ValueType == ECvarValueType::Unknown ? (Entry->Diagnostic.Severity == EDiagnosticSeverity::Error ? TEXT("Error") : TEXT("Value")) : GetValueTypeHint(Entry->Diagnostic.ValueType)); }).OnTextChanged_Lambda([this, Entry](const FText& NewText) { UpdateTableEntry(Entry, NewText, false); }).Visibility_Lambda([Entry] { return Entry->Diagnostic.ValueType == ECvarValueType::Bool && Entry->Diagnostic.Severity != EDiagnosticSeverity::Error ? EVisibility::Collapsed : EVisibility::Visible; })
+					]
+					+ SOverlay::Slot()
+					[
+						SNew(SCheckBox).IsChecked_Lambda([Entry] { bool bValue = false; return IsBooleanValue(Entry->Value, bValue) ? (bValue ? ECheckBoxState::Checked : ECheckBoxState::Unchecked) : ECheckBoxState::Undetermined; }).OnCheckStateChanged_Lambda([this, Entry](ECheckBoxState NewState) { UpdateTableBoolEntry(Entry, NewState); }).Visibility_Lambda([Entry] { return Entry->Diagnostic.ValueType == ECvarValueType::Bool && Entry->Diagnostic.Severity != EDiagnosticSeverity::Error ? EVisibility::Visible : EVisibility::Collapsed; })
+					];
 				return SNew(STableRow<TSharedPtr<FTableEntry>>, Owner)
 				[
 					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
+					[
+						SNew(SBox).WidthOverride(18.0f).HAlign(HAlign_Center).VAlign(VAlign_Center)
+						[
+							SNew(STextBlock).Text_Lambda([Entry] { return Entry->Diagnostic.Severity == EDiagnosticSeverity::None ? FText::GetEmpty() : FText::FromString(Entry->Diagnostic.Severity == EDiagnosticSeverity::Error ? TEXT("\u26A0") : TEXT("?")); }).ColorAndOpacity_Lambda([Entry] { return GetDiagnosticColor(Entry->Diagnostic); }).ToolTipText_Lambda([Entry] { return FText::FromString(Entry->Diagnostic.Message); })
+						]
+					]
 					+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
 					[
 						SNew(SEditableTextBox)
@@ -452,9 +637,7 @@ TSharedRef<SWidget> FCvarScopesModule::BuildTableEditor()
 					]
 					+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(2.0f)
 					[
-						SNew(SEditableTextBox)
-						.Text_Lambda([Entry] { return FText::FromString(Entry->Value); })
-						.OnTextChanged_Lambda([this, Entry](const FText& NewText) { UpdateTableEntry(Entry, NewText, false); })
+						ValueWidget
 					]
 				];
 			})
@@ -495,7 +678,8 @@ void FCvarScopesModule::RebuildTableItems()
 	{
 		Line.TrimStartAndEndInline();
 		TSharedPtr<FTableEntry> Entry = MakeShared<FTableEntry>();
-		if (Line.IsEmpty() || Line.StartsWith(TEXT("#")) || Line.StartsWith(TEXT(";")))
+		Entry->bIsCommentOrEmpty = Line.IsEmpty() || Line.StartsWith(TEXT("#")) || Line.StartsWith(TEXT(";"));
+		if (Entry->bIsCommentOrEmpty)
 		{
 			Entry->Name = MoveTemp(Line);
 		}
@@ -516,8 +700,19 @@ void FCvarScopesModule::RebuildTableItems()
 void FCvarScopesModule::UpdateTableEntry(TSharedPtr<FTableEntry> Entry, const FText& NewText, bool bIsName)
 {
 	if (!Entry.IsValid()) { return; }
-	if (bIsName) { Entry->Name = NewText.ToString(); }
+	if (bIsName)
+	{
+		Entry->Name = NewText.ToString();
+		Entry->bIsCommentOrEmpty = Entry->Name.TrimStartAndEnd().IsEmpty() || Entry->Name.TrimStartAndEnd().StartsWith(TEXT("#")) || Entry->Name.TrimStartAndEnd().StartsWith(TEXT(";"));
+	}
 	else { Entry->Value = NewText.ToString(); }
+	CommitTableEntries();
+}
+
+void FCvarScopesModule::UpdateTableBoolEntry(TSharedPtr<FTableEntry> Entry, ECheckBoxState NewState)
+{
+	if (!Entry.IsValid() || NewState == ECheckBoxState::Undetermined) { return; }
+	Entry->Value = NewState == ECheckBoxState::Checked ? TEXT("1") : TEXT("0");
 	CommitTableEntries();
 }
 
@@ -625,7 +820,7 @@ FCvarScopesModule::FCvarValueMap FCvarScopesModule::ParseCommands(const FString&
 		if (SplitIndex == INDEX_NONE) { continue; }
 		const FString Name = Line.Left(SplitIndex);
 		const FString Value = Line.Mid(SplitIndex).TrimStartAndEnd();
-		if (!Name.IsEmpty() && !Value.IsEmpty()) { Result.Add(Name, Value); }
+		if (!Name.IsEmpty() && !Value.IsEmpty() && ValidateAssignment(Name, Value).Severity == EDiagnosticSeverity::None) { Result.Add(Name, Value); }
 	}
 	return Result;
 }
